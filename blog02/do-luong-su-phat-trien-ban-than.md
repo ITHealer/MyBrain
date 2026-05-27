@@ -4,14 +4,13 @@ title: " Measuring personal growth"
 ---
 
 #  Measuring personal growth
-Đọc từ: https://luu.name.vn/do-luong-su-phat-trien-cua-ca-nhan-ban-theo-thoi-gian-huyen-chip/
 
-- 3 thang đo:
+3 thang đo:
 1. Tỷ lệ/mức độ thay đổi
 2. Thời gian giải quyết vấn đề
 3. Số lựa chọn trong tương lai
 
-- Why?
+Why?
 "Tại sao tôi nhất thiết phải đo lường tất cả mọi thứ chứ? Cuộc sống này là để sống, không phải để đo lường."
 
 ## 1. Mức độ thay đổi
@@ -55,3 +54,7 @@ Sami chỉ ra cho tôi bức ảnh này và tôi bất chợt ngừng lại và 
 3. Tôi sẽ hành động theo phương án cho phép tôi có nhiều lựa chọn nhất trong tương lai.
 
 3 phương pháp này đã và đang hoạt động với tôi bởi vì tôi nghĩ rất nhiều về những sự mới lạ và khám phá. Có lẽ ngày nào đó tôi sẽ mệt mỏi với việc đó và những phương pháp này sẽ thay đổi. Nhưng khi nhiều đó xảy ra có nghĩa là tôi đã trở thành con người mới, và tôi đã lớn lên.
+
+
+# References
+- Thanks anh Lưu, và tác giả chị Huyền
