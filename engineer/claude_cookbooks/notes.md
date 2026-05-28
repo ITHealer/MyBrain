@@ -1,5 +1,5 @@
 ---
-modified: 2026-05-27T05:59:53.109Z
+modified: 2026-05-27T06:47:25.999Z
 title: Knowledge Graph — Giải pháp theo đúng luồng build
 ---
 
@@ -425,3 +425,746 @@ KHÔNG rebuild toàn bộ graph từ đầu
   └─ Prompt caching + Batch API cho cost
   └─ Switch storage không ảnh hưởng extraction/resolution code
 ```
+
+
+## Bản tổng hợp từ nhiều nguồn
+# Tài liệu kỹ thuật: Xây dựng Knowledge Graph cho Agentic RAG
+
+---
+
+## Pipeline tổng quan
+
+```
+Documents
+    ↓
+[1] Chunking
+    ↓ — checkpoint —
+[2] LLM Extraction          ← thay thế NER + Relation Classifier
+    ↓ — checkpoint —
+[3] Entity Resolution       ← LLM clustering dùng description
+    ↓                         "gọi entity này là gì?" — KHÔNG merge
+[4] Entity Deduplication    ← embedding similarity trên full context
+    ↓                         "đây có phải cùng entity không?" — merge ở đây
+[5] Graph Assembly
+    ↓
+[6] Hub Summarization
+    ↓
+[7] Querying
+```
+
+**Ba nguyên tắc không được bỏ qua:**
+- Resolution và Deduplication là **hai bước khác nhau hoàn toàn** — đây là sai lầm phổ biến nhất
+- False merge **corrupt graph silently** — không có error log, query trả kết quả sai mà không biết
+- **Defensive default:** khi không chắc → tạo node mới, không merge
+
+---
+
+## Bước 1 — Chunking
+
+**Mục tiêu:** Chia document thành đơn vị xử lý phù hợp cho extraction.
+
+**Vấn đề:**
+- Chunk quá lớn → LLM extract quá nhiều incidental entities → graph nhiễu
+- Chunk quá nhỏ → relation bị cắt đứt giữa chừng → thiếu context
+
+**Giải pháp:** 512–1024 tokens per chunk, split theo semantic boundary (headers). Mỗi chunk giữ `document_id` để track provenance.
+
+```python
+def prepare_chunks(document: dict) -> list[dict]:
+    chunks = chunk_by_headers(document["text"])  # header-based split
+    return [
+        {
+            "chunk_id": f"{document['id']}_chunk_{i}",
+            "document_id": document["id"],
+            "document_title": document["title"],
+            "text": chunk,
+        }
+        for i, chunk in enumerate(chunks)
+    ]
+```
+
+**Rule cứng:** Một chunk không được span 2 documents. Chunk per-document trước, process sau.
+
+---
+
+## Bước 2 — LLM Extraction
+
+### Bối cảnh: Tại sao cần thay thế pipeline truyền thống?
+
+Pipeline truyền thống cần **hai model riêng biệt**, cả hai đều cần labeled training data:
+
+```
+[NER model]              → tag entity spans: (PERSON, ORG, LOC...)
+        ↓
+[Relation Classifier]    → classify pairs of spans thành relation types
+                           VD: (Neil Armstrong, Apollo 11) → "commanded"
+```
+
+Khi domain thay đổi (y tế → tài chính), phải train lại cả hai. Chi phí cao, không linh hoạt.
+
+**Giải pháp của cookbook:** Một LLM call với Pydantic schema **thay thế hoàn toàn cả NER lẫn Relation Classifier**. Schema là "training" — không cần labeled data.
+
+### Implementation
+
+```python
+from pydantic import BaseModel
+from typing import Literal
+
+EntityType = Literal["PERSON", "ORGANIZATION", "LOCATION", "EVENT", "ARTIFACT"]
+
+class Entity(BaseModel):
+    name: str
+    type: EntityType
+    description: str  # BẮT BUỘC: 1 câu grounded trong document này
+                      # Thiếu field này → Resolution bước 3 sẽ sai
+
+class Relation(BaseModel):
+    source: str       # tên entity đã extract trong chunk này
+    predicate: str    # short verb phrase: "commands", "treats", "founded"
+    target: str       # tên entity đã extract trong chunk này
+
+class ExtractedGraph(BaseModel):
+    entities: list[Entity]
+    relations: list[Relation]
+
+EXTRACTION_PROMPT = """Extract a knowledge graph from the document below.
+
+<document>
+{text}
+</document>
+
+Rules:
+- Extract ONLY entities central to this document. Skip incidental mentions.
+- Each entity MUST have a 1-sentence description grounded in THIS document.
+  This description will be used later to distinguish entities with similar names.
+- Predicates must be short verb phrases: "commands", "treats", "founded by".
+- Every relation must connect two entities you extracted above.
+  Do NOT create relations to entities not in your list."""
+
+def extract(chunk: dict) -> ExtractedGraph | None:
+    result = client.messages.parse(
+        model=KG_EXTRACTION_MODEL,  # KHÔNG dùng nano — xem issue bên dưới
+        messages=[{"role": "user",
+                   "content": EXTRACTION_PROMPT.format(text=chunk["text"])}],
+        output_format=ExtractedGraph,
+    )
+    if len(result.entities) == 0:
+        logger.warning(f"0 entities from chunk {chunk['chunk_id']}")
+        return None
+    return result
+```
+
+**Tại sao `description` bắt buộc ngay tại đây?**
+
+Bước 3 (Resolution) dùng LLM để cluster entities. LLM cần nhìn thấy description để phân biệt:
+- `"Armstrong: first human to walk on the Moon"` vs `"Armstrong: jazz trumpeter"`
+- Không có description → LLM không có context → cluster sai
+
+### Issue: Model nhỏ không follow JSON schema → 0 entities, silent failure
+
+```
+Log thực tế:
+KG extraction produced 0 entities.
+Model 'gpt-4.1-nano' may not support entity extraction format.
+```
+
+Pipeline chạy thành công nhưng graph rỗng — không có error, không có warning rõ ràng.
+
+**Giải pháp:** Tách model config cho KG extraction, validate output:
+
+```python
+# config
+LLM_CHAT_MODEL          = "gpt-4.1-nano"    # OK cho chat, rẻ
+LLM_KG_EXTRACTION_MODEL = "gpt-4.1-mini"    # riêng cho KG extraction
+
+# Model đủ lớn cho KG extraction:
+# ✅ gpt-4.1-mini, gpt-4.1, claude-haiku-4-5, gemini-flash, qwen3:14b
+# ❌ nano-class models
+```
+
+### Issue: Fail giữa chừng → tốn lại toàn bộ token
+
+Extraction là bước tốn tiền nhất. Nếu fail ở chunk 500/1000, không có checkpoint → chạy lại từ đầu.
+
+**Giải pháp:** Checkpoint per chunk:
+
+```python
+def extract_with_checkpoint(chunks: list[dict], checkpoint_dir: str) -> list[dict]:
+    Path(checkpoint_dir).mkdir(exist_ok=True)
+    results = []
+
+    for chunk in chunks:
+        checkpoint_file = Path(checkpoint_dir) / f"{chunk['chunk_id']}.json"
+
+        if checkpoint_file.exists():            # đã có → skip, không gọi LLM lại
+            results.append(json.load(open(checkpoint_file)))
+            continue
+
+        result = extract(chunk)
+        if result:
+            data = {
+                "chunk_id": chunk["chunk_id"],
+                "document_id": chunk["document_id"],
+                "document_title": chunk["document_title"],
+                "entities": [e.model_dump() for e in result.entities],
+                "relations": [r.model_dump() for r in result.relations],
+            }
+            checkpoint_file.write_text(json.dumps(data))
+            results.append(data)
+
+    return results
+```
+
+---
+
+## Bước 3 — Entity Resolution
+
+> **Định nghĩa chính xác:** "Gọi entity này là gì?" — cập nhật canonical name. **KHÔNG merge nodes.**
+
+### Tại sao string similarity không đủ?
+
+```
+"Edwin Aldrin" vs "Buzz Aldrin"
+→ edit distance: rất thấp (khác hoàn toàn)
+→ Jaccard on tokens: 0 (không có token chung)
+→ string similarity: FAIL
+
+→ Nhưng descriptions nói: cả hai đều là
+  "Lunar Module Pilot on Apollo 11, second human on Moon"
+→ LLM đọc description → hiểu đây là cùng người
+```
+
+**Đây là lý do cookbook dùng LLM clustering với description context** — không phải embedding hay fuzzy matching ở bước này.
+
+### Implementation — LLM clustering với descriptions
+
+```python
+from pydantic import BaseModel
+
+class Cluster(BaseModel):
+    canonical: str        # most complete, unambiguous form
+    aliases: list[str]    # tất cả surface forms map về canonical này
+
+class ResolvedClusters(BaseModel):
+    clusters: list[Cluster]
+
+RESOLVE_PROMPT = """Below are {entity_type} entities extracted from 
+several documents. Some are different surface forms of the same 
+real-world entity.
+
+<entities>
+{entity_list}
+</entities>
+
+Rules:
+- Each input name must appear in exactly one cluster's aliases list.
+- Entities genuinely distinct → own single-element cluster.
+- Use the descriptions to avoid merging entities sharing only a name.
+  Example: "Apple (technology company)" ≠ "Apple (fruit)"
+- Canonical = most complete, unambiguous form.
+- Do NOT merge based on name similarity alone."""
+
+def resolve(entity_type: str, entities: list[dict]) -> list[Cluster]:
+    # Dedup by name trước khi gửi LLM
+    unique = {}
+    for e in entities:
+        unique.setdefault(e["name"], e["description"])
+
+    entity_list = "\n".join(
+        f"- {name}: {desc}"
+        for name, desc in unique.items()
+    )
+
+    response = client.messages.parse(
+        model=SYNTHESIS_MODEL,   # cần model lớn hơn extraction
+        messages=[{"role": "user",
+                   "content": RESOLVE_PROMPT.format(
+                       entity_type=entity_type,
+                       entity_list=entity_list,
+                   )}],
+        output_format=ResolvedClusters,
+    )
+    return response.parsed_output.clusters
+```
+
+**Lý do chỉ cluster entities cùng type:** "Apple" (ORGANIZATION) không thể match "Apple" (ARTIFACT). Type filtering là guard đầu tiên chống false resolution.
+
+### Issue: Entity bị drop silently
+
+LLM có thể bỏ sót một entity không assign vào cluster nào → `alias_to_canonical` không có key → node biến mất hoàn toàn.
+
+**Giải pháp: Mandatory fallback**
+
+```python
+def resolve_with_fallback(entity_type: str,
+                          entities: list[dict]) -> dict[str, str]:
+    """Returns: alias → canonical map"""
+    try:
+        clusters = resolve(entity_type, entities)
+    except Exception:
+        # Hard fallback: mỗi name là cluster riêng
+        return {e["name"]: e["name"] for e in entities}
+
+    alias_to_canonical = {}
+    for cluster in clusters:
+        for alias in cluster.aliases:
+            alias_to_canonical[alias] = cluster.canonical
+
+    # Verify không có entity nào bị drop
+    all_input = {e["name"] for e in entities}
+    all_clustered = set(alias_to_canonical.keys())
+    dropped = all_input - all_clustered
+
+    for name in dropped:
+        # Single-element cluster cho entity bị bỏ sót
+        alias_to_canonical[name] = name
+        logger.warning(f"Entity '{name}' not clustered, added as standalone")
+
+    return alias_to_canonical
+```
+
+### Issue: Over-merging — "Gemini 12" bị fold vào "Project Gemini"
+
+LLM thấy descriptions overlap → merge nhầm specific mission với broad program.
+
+**Giải pháp:** Extraction description phải đủ specific:
+- Sai: `"Gemini 12: a NASA mission"`
+- Đúng: `"Gemini 12: Buzz Aldrin's final spaceflight before Apollo 11, last Gemini mission"`
+
+### Issue: Scale — 10,000 entities không fit 1 prompt
+
+**Giải pháp: Block trước bằng cheap signals, LLM arbitrate trong block nhỏ**
+
+```python
+def block_and_resolve(entities: list[dict],
+                      entity_type: str) -> dict[str, str]:
+    """
+    Block theo cheap signals trước:
+    1. Same last name (PERSON)
+    2. Token overlap > 0.3 (Jaccard)
+    3. Embedding cosine > 0.85
+    
+    Mỗi block: 50-100 entities → gửi LLM
+    LLM KHÔNG biết entities ở block khác → không cross-block merge
+    Target block size: 50-100 entities
+    """
+    blocks = create_blocks(entities)  # cheap grouping
+    alias_to_canonical = {}
+
+    for block in blocks:
+        block_result = resolve_with_fallback(entity_type, block)
+        alias_to_canonical.update(block_result)
+
+    return alias_to_canonical
+```
+
+**Quan trọng:** Resolution chỉ cập nhật canonical name để dùng cho soft matching. **Không merge nodes. Không thay đổi graph.**
+
+---
+
+## Bước 4 — Entity Deduplication
+
+> **Định nghĩa chính xác:** "Đây có phải cùng entity thật không?" — đây là bước duy nhất quyết định merge.
+
+### Tại sao Resolution không đủ để merge?
+
+```
+Resolution xong ta biết:
+"Edwin Aldrin" và "Buzz Aldrin" → canonical = "Buzz Aldrin"
+
+Nhưng canonical name giống nhau KHÔNG chứng minh cùng entity:
+"Jensen Huang" (CEO NVIDIA) vs "Jensen Huang" (bác sĩ ở Đài Loan)
+→ Cùng canonical name sau resolution
+→ KHÔNG phải cùng người
+→ Merge sai → toàn bộ NVIDIA relations gán cho bác sĩ → graph corrupt silently
+```
+
+**Nguyên tắc từ image:** `Evidence strength = Permission strength`
+
+```
+≥ 0.95 → auto-merge       (strong evidence, đủ tin)
+> 0.85 → flag for review   (uncertain, cần human)
+≤ 0.85 → new node          (weak evidence, defensive default)
+```
+
+### Implementation — 3-tier confidence scoring trên full context
+
+```python
+from sentence_transformers import SentenceTransformer
+from rapidfuzz import fuzz
+
+encoder = SentenceTransformer("BAAI/bge-m3")
+
+def build_entity_context(entity: dict) -> str:
+    """
+    Full context = name + type + description + relations
+    Không dùng chỉ name hay chỉ description
+    """
+    relations_str = "; ".join(entity.get("relations", []))
+    return (
+        f"Name: {entity['name']}. "
+        f"Type: {entity['type']}. "
+        f"Description: {entity['description']}. "
+        f"Known relations: {relations_str}"
+    )
+
+def compute_similarity(new_entity: dict,
+                       existing_node: dict) -> float:
+    new_ctx = build_entity_context(new_entity)
+    existing_ctx = build_entity_context(existing_node)
+
+    # Semantic similarity trên full context (70% weight)
+    new_emb = encoder.encode(new_ctx, normalize_embeddings=True)
+    existing_emb = encoder.encode(existing_ctx, normalize_embeddings=True)
+    semantic_score = float(new_emb @ existing_emb)
+
+    # Fuzzy similarity trên name (30% weight — supporting signal)
+    name_score = fuzz.ratio(
+        new_entity["name"].lower(),
+        existing_node["name"].lower()
+    ) / 100
+
+    return 0.7 * semantic_score + 0.3 * name_score
+
+def deduplicate(new_entity: dict,
+                same_type_nodes: list[dict]) -> dict:
+    """
+    Returns one of:
+    {"action": "new_node"}
+    {"action": "merge", "target_id": str}
+    {"action": "flag_review", "candidate_id": str, "score": float}
+    """
+    if not same_type_nodes:
+        return {"action": "new_node"}
+
+    scores = [
+        (node, compute_similarity(new_entity, node))
+        for node in same_type_nodes
+    ]
+    best_node, best_score = max(scores, key=lambda x: x[1])
+
+    if best_score >= 0.95:
+        return {"action": "merge", "target_id": best_node["id"]}
+    elif best_score > 0.85:
+        return {"action": "flag_review",
+                "candidate_id": best_node["id"],
+                "score": best_score}
+    else:
+        return {"action": "new_node"}  # defensive default
+```
+
+### Issue: Embedding là bước đắt — cần cache
+
+```python
+import hashlib
+import numpy as np
+
+def embed_with_cache(entity: dict, cache_dir: str) -> np.ndarray:
+    # Hash theo content, không phải name
+    # Cùng name, khác description → hash khác → embed lại đúng
+    content = f"{entity['name']}|{entity['description']}"
+    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+    cache_file = Path(cache_dir) / f"{content_hash}.npy"
+
+    if cache_file.exists():
+        return np.load(cache_file)
+
+    emb = encoder.encode(content, normalize_embeddings=True)
+    np.save(cache_file, emb)
+    return emb
+```
+
+---
+
+## Bước 5 — Graph Assembly
+
+**Mục tiêu:** Dùng `alias_to_canonical` map từ Resolution để rewrite relation endpoints, load vào graph.
+
+```python
+import networkx as nx
+
+def assemble_graph(canonical_entities: dict,
+                   raw_relations: list[dict],
+                   alias_to_canonical: dict) -> nx.MultiDiGraph:
+    """
+    MultiDiGraph vì:
+    - Multi: 2 nodes có nhiều predicates khác nhau
+      VD: Drug → Condition: "treats" VÀ "causes side effect"
+    - Directed: quan hệ có chiều
+      "Armstrong commanded Apollo 11" ≠ "Apollo 11 commanded Armstrong"
+    """
+    G = nx.MultiDiGraph()
+
+    for canonical_name, info in canonical_entities.items():
+        G.add_node(canonical_name,
+                   type=info["type"],
+                   description=info["description"],
+                   source_docs=[],
+                   mentions=0)
+
+    stats = {"added": 0, "skipped": 0}
+
+    for rel in raw_relations:
+        src = alias_to_canonical.get(rel["source"])
+        tgt = alias_to_canonical.get(rel["target"])
+
+        # Guard 1: endpoint không có canonical → skip
+        if not src or not tgt:
+            stats["skipped"] += 1
+            continue
+
+        # Guard 2: self-loop → skip
+        if src == tgt:
+            stats["skipped"] += 1
+            continue
+
+        G.add_edge(src, tgt,
+                   predicate=rel["predicate"],
+                   source_doc=rel["source_doc"])
+        stats["added"] += 1
+
+    # Sanity check sau khi build
+    components = nx.number_weakly_connected_components(G)
+    if components > 3:
+        logger.warning(
+            f"Graph has {components} connected components — "
+            "likely indicates entity resolution gaps. Inspect isolated nodes."
+        )
+
+    logger.info(f"Assembly: {stats}")
+    return G
+```
+
+**Fragmented graph (nhiều components)** = dấu hiệu Resolution bị miss — có entity variants chưa được cluster đúng.
+
+---
+
+## Bước 6 — Hub Node Summarization
+
+**Mục tiêu:** Hub nodes (degree cao) xuất hiện trong nhiều documents. Node description chỉ lưu context từ 1 document đầu — không đủ.
+
+```python
+SUMMARIZE_PROMPT = """Generate a profile for this entity.
+
+Entity: {name} ({type})
+
+All source excerpts:
+{excerpts}
+
+Known graph relations:
+{relations}
+
+Output:
+- summary: 2-3 paragraphs synthesized from excerpts.
+  Resolve contradictions by preferring the most specific claim.
+- key_facts: 3-5 atomic facts, each traceable to a specific source.
+- time_range: YYYY format. "unknown" or "ongoing" where appropriate.
+
+Do NOT invent facts not supported by the excerpts."""
+
+def summarize_hub_nodes(G: nx.MultiDiGraph,
+                        documents: list[dict],
+                        min_degree: int = 5):
+    for node in G.nodes:
+        if G.degree(node) < min_degree:
+            continue  # chỉ summarize hub nodes
+
+        source_docs = G.nodes[node]["source_docs"]
+        excerpts = "\n\n".join(
+            f"[{d['title']}]\n{d['text']}"
+            for d in documents
+            if d["title"] in source_docs
+        )
+        relations = "\n".join(
+            f"- {node} --{d['predicate']}--> {tgt}"
+            for _, tgt, d in G.out_edges(node, data=True)
+        )
+
+        profile = client.messages.parse(
+            model=SYNTHESIS_MODEL,
+            messages=[{"role": "user",
+                       "content": SUMMARIZE_PROMPT.format(
+                           name=node,
+                           type=G.nodes[node]["type"],
+                           excerpts=excerpts,
+                           relations=relations,
+                       )}],
+            output_format=EntityProfile,
+        )
+        G.nodes[node]["profile"] = profile.model_dump()
+```
+
+**Rule incremental:** Chỉ re-summarize khi `source_docs` thay đổi. Không re-summarize khi document mới không đề cập entity đó.
+
+---
+
+## Bước 7 — Querying với Multi-hop Reasoning
+
+**Vấn đề:** LLM có pretraining knowledge về famous entities → trả lời "đúng" nhưng không traceable, không auditable. Với private corpus (hồ sơ bệnh nhân, tài liệu nội bộ) → hallucinate.
+
+**Giải pháp:** Serialize subgraph → hard constraint prompt buộc cite edges.
+
+```python
+def serialize_subgraph(G: nx.MultiDiGraph,
+                       center: str,
+                       hops: int = 2) -> str:
+    """
+    2-hop đủ cho hầu hết queries.
+    3-hop bắt đầu noisy và tốn token.
+    """
+    nodes = {center}
+    frontier = {center}
+    for _ in range(hops):
+        nxt = set()
+        for n in frontier:
+            nxt |= set(G.successors(n)) | set(G.predecessors(n))
+        frontier = nxt - nodes
+        nodes |= frontier
+
+    sub = G.subgraph(nodes)
+    lines = [
+        f"({src}) --[{data['predicate']}]--> ({tgt})"
+        for src, tgt, data in sub.edges(data=True)
+    ]
+    return "\n".join(sorted(set(lines)))
+
+QUERY_PROMPT = """Answer using ONLY the knowledge graph below.
+For every claim, cite the specific edge(s) supporting it.
+If the graph does not contain sufficient information, say:
+"The knowledge graph does not contain information about this."
+Do NOT use external knowledge.
+
+<graph>
+{subgraph}
+</graph>
+
+Question: {question}"""
+```
+
+**Tại sao "say so explicitly" bắt buộc:** Không có câu này → LLM fill gap bằng pretraining silently → answer fluent nhưng không grounded → audit fail.
+
+---
+
+## Incremental Update
+
+**Pattern sai:** Rebuild toàn bộ graph mỗi khi có document mới.
+
+**Pattern đúng:**
+
+```python
+def ingest_new_document(doc: dict, G: nx.MultiDiGraph,
+                        canonical_registry: dict) -> nx.MultiDiGraph:
+    """
+    Quy trình đúng:
+    1. Extract từ document mới
+    2. Resolve entities mới against EXISTING canonical set
+       (không phải against each other)
+    3. Deduplicate against existing graph nodes
+    4. Add chỉ edges mới
+    5. Re-summarize chỉ nodes có source_docs thay đổi
+    """
+    extracted = extract(doc)
+    if not extracted:
+        return G
+
+    for entity in extracted.entities:
+        # Resolve against existing canonical names của cùng type
+        existing_names = list(canonical_registry.get(entity.type, set()))
+        canonical = resolve_single_entity(entity.name, entity.description,
+                                          existing_names)
+
+        # Dedup against existing nodes cùng type
+        same_type_nodes = [
+            {"id": n, **G.nodes[n]}
+            for n in G.nodes
+            if G.nodes[n].get("type") == entity.type
+        ]
+        action = deduplicate(
+            {"name": canonical, "type": entity.type,
+             "description": entity.description},
+            same_type_nodes
+        )
+
+        if action["action"] == "merge":
+            target = action["target_id"]
+            old_docs = set(G.nodes[target]["source_docs"])
+            G.nodes[target]["source_docs"].append(doc["title"])
+            G.nodes[target]["mentions"] += 1
+            # Re-summarize chỉ khi source_docs thay đổi
+            if set(G.nodes[target]["source_docs"]) != old_docs:
+                G.nodes[target]["profile"] = summarize_entity(target, G)
+
+        elif action["action"] == "new_node":
+            G.add_node(canonical, type=entity.type,
+                       description=entity.description,
+                       source_docs=[doc["title"]], mentions=1)
+            canonical_registry.setdefault(entity.type, set()).add(canonical)
+
+        elif action["action"] == "flag_review":
+            review_queue.append({
+                "new_entity": entity.model_dump(),
+                "candidate": action["candidate_id"],
+                "score": action["score"],
+                "source_doc": doc["title"],
+            })
+
+    return G
+```
+
+---
+
+## Evaluation
+
+```python
+def evaluate(predicted_entities: set[str],
+             gold_entities: set[str],
+             alias_map: dict) -> dict:
+    """
+    alias_map.json bắt buộc — không có thì canonical form verbose
+    ("Neil Alden Armstrong") không match gold ("Neil Armstrong")
+    → recall giảm giả tạo → metrics misleading
+
+    Đo 2 lần:
+    - Raw F1: chất lượng extraction prompt
+    - Resolved recall: chất lượng resolution step
+    Nếu resolved recall < raw recall → resolver over-normalizing
+    """
+    def norm(name: str) -> str:
+        return alias_map.get(name.lower().strip(), name.lower().strip())
+
+    pred = {norm(e) for e in predicted_entities}
+    gold = {norm(e) for e in gold_entities}
+
+    tp = len(pred & gold)
+    precision = tp / len(pred) if pred else 0.0
+    recall    = tp / len(gold) if gold else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "precision": round(precision, 3),
+        "recall": round(recall, 3),
+        "f1": round(f1, 3),
+        "missed": sorted(gold - pred),
+    }
+```
+
+**Feedback loop bắt buộc:** Chạy eval sau mỗi thay đổi extraction prompt. Không có eval loop = không biết thay đổi có cải thiện hay không.
+
+---
+
+## Tổng hợp issues và giải pháp
+
+| Bước | Issue | Hậu quả | Giải pháp |
+|---|---|---|---|
+| Extraction | Model nano không follow schema | 0 entities, silent | Tách `KG_EXTRACTION_MODEL`, validate output |
+| Extraction | Không có `description` field | Resolution sai | Enforce trong Pydantic schema |
+| Extraction | Không checkpoint | Tốn lại toàn bộ token | Checkpoint per chunk |
+| Resolution | Entity bị drop | Node biến mất silently | Mandatory fallback single-element cluster |
+| Resolution | Over-merging | Mất precision | Description đủ specific khi extract |
+| Resolution | Scale > 1000 entities | Không fit 1 prompt | Block by cheap signals, 50-100 per block |
+| Deduplication | False merge cùng tên khác người | Graph corrupt silently | 3-tier: 0.95 merge / 0.85 review / default new node |
+| Deduplication | Embedding đắt, hay retry | Tốn tiền | Cache by content hash |
+| Assembly | Fragmented graph | Multi-hop fail | Check components sau build, inspect orphans |
+| Querying | LLM fallback pretraining | Ungrounded answer | Hard-constrain prompt + cite edges |
+| Incremental | Rebuild toàn bộ | Không scale | Resolve new against existing canonical set |
+| Evaluation | Canonical verbose không match gold | Metrics misleading | `alias_map.json` + update sau mỗi run |
